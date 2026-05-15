@@ -270,7 +270,151 @@ function createMcpServer(apiKey: string): McpServer {
     },
   );
 
-  // ── 4. list_droids ───────────────────────────────────────────────
+  // ── 4. spawn_and_watch ──────────────────────────────────────────
+  server.registerTool(
+    "spawn_and_watch",
+    {
+      description:
+        "Spawn a droid and poll until it completes (goes idle), then return the full " +
+        "message log. This is a single-call alternative to spawn + poll + fetch messages.",
+      inputSchema: {
+        prompt: z
+          .string()
+          .describe("The task prompt for the droid to execute (required)"),
+        model: z
+          .string()
+          .optional()
+          .describe("Model to use (e.g. claude-opus-4-7, claude-sonnet-4-6, gpt-5)"),
+        autonomy: z
+          .enum(["off", "low", "medium", "high"])
+          .optional()
+          .describe("Autonomy level: off, low, medium, high"),
+        reasoningEffort: z
+          .enum(["none", "minimal", "low", "medium", "high", "xhigh", "max"])
+          .optional()
+          .describe("Reasoning effort for the model"),
+        computerId: z
+          .string()
+          .optional()
+          .describe("Computer ID (defaults to first active)"),
+        pollIntervalSeconds: z
+          .number()
+          .int()
+          .min(5)
+          .max(60)
+          .optional()
+          .default(15)
+          .describe("Seconds between status polls (5–60, default 15)"),
+        timeoutSeconds: z
+          .number()
+          .int()
+          .min(30)
+          .max(3600)
+          .optional()
+          .default(600)
+          .describe("Max seconds to wait before giving up (30–3600, default 600)"),
+      },
+    },
+    async (args) => {
+      // Resolve computer
+      let computerId = args.computerId;
+      if (!computerId) {
+        const data = (await factoryFetch("/computers", apiKey)) as {
+          computers: Array<{ id: string; status: string }>;
+        };
+        const active = data.computers.filter((c) => c.status === "active");
+        if (active.length === 0) throw new Error("No active computers available");
+        computerId = active[0].id;
+      }
+
+      const model = args.model ?? "claude-sonnet-4-6";
+      const pollMs = (args.pollIntervalSeconds ?? 15) * 1000;
+      const deadline = Date.now() + (args.timeoutSeconds ?? 600) * 1000;
+
+      // Step 1: Create session and send prompt
+      const sessionBody: Record<string, unknown> = {
+        computerId,
+        sessionSettings: { model },
+      };
+      if (args.autonomy) {
+        (sessionBody.sessionSettings as Record<string, unknown>).autonomyLevel =
+          args.autonomy;
+      }
+      if (args.reasoningEffort) {
+        (sessionBody.sessionSettings as Record<string, unknown>).reasoningEffort =
+          args.reasoningEffort;
+      }
+
+      const session = (await factoryFetch("/sessions", apiKey, {
+        method: "POST",
+        body: JSON.stringify(sessionBody),
+      })) as { sessionId: string; status: string };
+
+      await factoryFetch(`/sessions/${session.sessionId}/messages`, apiKey, {
+        method: "POST",
+        body: JSON.stringify({ text: args.prompt }),
+      });
+
+      // Step 2: Poll until idle or timeout
+      let finalStatus = "";
+      while (Date.now() < deadline) {
+        const statusData = (await factoryFetch(
+          `/sessions/${session.sessionId}`,
+          apiKey,
+        )) as { status: string };
+        if (statusData.status === "idle" || statusData.status === "error") {
+          finalStatus = statusData.status;
+          break;
+        }
+        // Wait before next poll
+        await new Promise((resolve) => setTimeout(resolve, pollMs));
+      }
+
+      if (!finalStatus) {
+        // Try to interrupt the timed-out session
+        try {
+          await factoryFetch(
+            `/sessions/${session.sessionId}/interrupt`,
+            apiKey,
+            { method: "POST" },
+          );
+        } catch {
+          // Best effort
+        }
+        finalStatus = "timeout";
+      }
+
+      // Step 3: Fetch all messages
+      const messages = (await factoryFetch(
+        `/sessions/${session.sessionId}/messages?limit=200`,
+        apiKey,
+      )) as { messages: Array<{ role: string; content: unknown }> };
+
+      const msgLines = (messages.messages ?? []).map(
+        (m: { role: string; content: unknown }, i: number) =>
+          `  [${i}] ${m.role}: ${JSON.stringify(m.content).slice(0, 500)}`,
+      );
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: [
+              `Droid completed!`,
+              `  sessionId: ${session.sessionId}`,
+              `  status:    ${finalStatus}`,
+              `  messages:  ${messages.messages?.length ?? 0}`,
+              ``,
+              `Full message log:`,
+              ...msgLines,
+            ].join("\n"),
+          },
+        ],
+      };
+    },
+  );
+
+  // ── 5. list_droids ───────────────────────────────────────────────
   server.registerTool(
     "list_droids",
     {
@@ -320,7 +464,7 @@ function createMcpServer(apiKey: string): McpServer {
           (s.title ?? "untitled").slice(0, 60) +
           ((s.title?.length ?? 0) > 60 ? "..." : "");
         const date = new Date(s.createdAt).toISOString();
-        return `${s.sessionId.slice(0, 8)}...  [${s.status}]  ${title}  msgs=${s.messageCount}  ${date}`;
+        return `${s.sessionId}  [${s.status}]  ${title}  msgs=${s.messageCount}  ${date}`;
       });
 
       return {
@@ -334,7 +478,86 @@ function createMcpServer(apiKey: string): McpServer {
     },
   );
 
-  // ── 5. get_droid ─────────────────────────────────────────────────
+  // ── 6. get_all_active_droids ─────────────────────────────────────
+  server.registerTool(
+    "get_all_active_droids",
+    {
+      description:
+        "Get all currently active (pending or running) droid sessions with full session IDs, " +
+        "current status, message count, last message preview, and elapsed time.",
+    },
+    async () => {
+      const data = (await factoryFetch("/sessions?limit=100", apiKey)) as {
+        sessions: Array<{
+          sessionId: string;
+          title: string;
+          status: string;
+          createdAt: number;
+          messageCount: number;
+          computerId?: string;
+        }>;
+      };
+
+      const active = data.sessions.filter(
+        (s) => s.status === "pending" || s.status === "running",
+      );
+
+      if (active.length === 0) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: "No active (pending/running) droid sessions found.",
+            },
+          ],
+        };
+      }
+
+      const now = Date.now();
+      const lines = await Promise.all(
+        active.map(async (s) => {
+          const elapsed = Math.floor((now - s.createdAt) / 1000);
+          const elapsedStr =
+            elapsed < 60
+              ? `${elapsed}s`
+              : elapsed < 3600
+                ? `${Math.floor(elapsed / 60)}m ${elapsed % 60}s`
+                : `${Math.floor(elapsed / 3600)}h ${Math.floor((elapsed % 3600) / 60)}m`;
+
+          // Get last message preview
+          let lastMsg = "(no messages)";
+          try {
+            const msgs = (await factoryFetch(
+              `/sessions/${s.sessionId}/messages?limit=1`,
+              apiKey,
+            )) as { messages: Array<{ role: string; content: unknown }> };
+            if (msgs.messages && msgs.messages.length > 0) {
+              const m = msgs.messages[msgs.messages.length - 1];
+              lastMsg = `[${m.role}] ${JSON.stringify(m.content).slice(0, 120)}`;
+            }
+          } catch {
+            lastMsg = "(error fetching)";
+          }
+
+          return (
+            `${s.sessionId}  [${s.status}]  elapsed=${elapsedStr}  ` +
+            `msgs=${s.messageCount}  last=${lastMsg}`
+          );
+        }),
+      );
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: `${active.length} active droid(s):\n${lines.join("\n")}`,
+          },
+        ],
+      };
+    },
+  );
+
+  // ── 7. get_droid ─────────────────────────────────────────────────
   server.registerTool(
     "get_droid",
     {
@@ -387,7 +610,75 @@ function createMcpServer(apiKey: string): McpServer {
     },
   );
 
-  // ── 6. message_droid ─────────────────────────────────────────────
+  // ── 8. get_droid_messages_full ───────────────────────────────────
+  server.registerTool(
+    "get_droid_messages_full",
+    {
+      description:
+        "Get ALL messages from a droid session (not just recent ones), with role labels " +
+        "(user/assistant) and timestamps. Useful for reviewing droid outputs and file contents.",
+      inputSchema: {
+        sessionId: z.string().describe("The droid session ID to fetch messages for"),
+        maxMessages: z
+          .number()
+          .int()
+          .min(1)
+          .max(500)
+          .optional()
+          .default(200)
+          .describe("Max messages to return (1–500, default 200)"),
+      },
+    },
+    async (args) => {
+      const session = (await factoryFetch(
+        `/sessions/${args.sessionId}`,
+        apiKey,
+      )) as Record<string, unknown>;
+
+      const messages = (await factoryFetch(
+        `/sessions/${args.sessionId}/messages?limit=${args.maxMessages ?? 200}`,
+        apiKey,
+      )) as {
+        messages: Array<{
+          role: string;
+          content: unknown;
+          createdAt?: number;
+        }>;
+      };
+
+      const msgs = messages.messages ?? [];
+      const msgLines = msgs.map(
+        (m: { role: string; content: unknown; createdAt?: number }, i: number) => {
+          const ts = m.createdAt
+            ? new Date(m.createdAt).toISOString()
+            : "unknown";
+          const body = JSON.stringify(m.content).slice(0, 600);
+          return `  [${i}] ${ts}  ${m.role}:\n    ${body}`;
+        },
+      );
+
+      const ss = session.sessionSettings as Record<string, unknown> | undefined;
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: [
+              `Droid ${args.sessionId} — Full Message Log`,
+              `  status:       ${session.status ?? "?"}`,
+              `  title:        ${(session.title as string) ?? "untitled"}`,
+              `  model:        ${ss?.model ?? "?"}`,
+              `  total msgs:   ${msgs.length}`,
+              ``,
+              ...msgLines,
+            ].join("\n"),
+          },
+        ],
+      };
+    },
+  );
+
+  // ── 9. message_droid ─────────────────────────────────────────────
   server.registerTool(
     "message_droid",
     {
@@ -415,7 +706,114 @@ function createMcpServer(apiKey: string): McpServer {
     },
   );
 
-  // ── 7. interrupt_droid ───────────────────────────────────────────
+  // ── 10. respawn_with_context ─────────────────────────────────────
+  server.registerTool(
+    "respawn_with_context",
+    {
+      description:
+        "Continue a dead (idle) session by fetching its full message log and spawning " +
+        "a NEW droid with that context prepended plus a follow-up prompt. Simulates " +
+        "session continuation.",
+      inputSchema: {
+        sessionId: z
+          .string()
+          .describe("The completed droid session ID to resume from"),
+        followupPrompt: z
+          .string()
+          .describe("The follow-up task or question for the new droid"),
+        model: z
+          .string()
+          .optional()
+          .describe("Model for the new droid (defaults to claude-sonnet-4-6)"),
+        autonomy: z
+          .enum(["off", "low", "medium", "high"])
+          .optional()
+          .describe("Autonomy level for the new droid"),
+        computerId: z
+          .string()
+          .optional()
+          .describe("Computer ID (defaults to first active)"),
+      },
+    },
+    async (args) => {
+      // Step 1: Fetch full message log from completed session
+      const oldMessages = (await factoryFetch(
+        `/sessions/${args.sessionId}/messages?limit=200`,
+        apiKey,
+      )) as {
+        messages: Array<{ role: string; content: unknown }>;
+      };
+
+      const msgs = oldMessages.messages ?? [];
+      if (msgs.length === 0) {
+        throw new Error(`Session ${args.sessionId} has no messages to resume from`);
+      }
+
+      // Step 2: Build context from old messages
+      const contextLines = [
+        `=== CONTEXT FROM PREVIOUS SESSION (${args.sessionId}) ===`,
+        "",
+      ];
+      for (const m of msgs) {
+        contextLines.push(
+          `[${m.role}]: ${JSON.stringify(m.content).slice(0, 2000)}`,
+        );
+        contextLines.push("");
+      }
+      contextLines.push("=== END CONTEXT ===");
+      contextLines.push("");
+      contextLines.push("NEW INSTRUCTION (follow-up):");
+      contextLines.push(args.followupPrompt);
+
+      const fullPrompt = contextLines.join("\n");
+
+      // Step 3: Resolve computer
+      let computerId = args.computerId;
+      if (!computerId) {
+        const data = (await factoryFetch("/computers", apiKey)) as {
+          computers: Array<{ id: string; status: string }>;
+        };
+        const active = data.computers.filter((c) => c.status === "active");
+        if (active.length === 0) throw new Error("No active computers available");
+        computerId = active[0].id;
+      }
+
+      const model = args.model ?? "claude-sonnet-4-6";
+      const sessionSettings: Record<string, unknown> = { model };
+      if (args.autonomy) sessionSettings.autonomyLevel = args.autonomy;
+
+      // Step 4: Spawn new droid with full context
+      const session = (await factoryFetch("/sessions", apiKey, {
+        method: "POST",
+        body: JSON.stringify({ computerId, sessionSettings }),
+      })) as { sessionId: string; status: string };
+
+      await factoryFetch(`/sessions/${session.sessionId}/messages`, apiKey, {
+        method: "POST",
+        body: JSON.stringify({ text: fullPrompt }),
+      });
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: [
+              `Respawned droid with context from ${args.sessionId}:`,
+              `  new sessionId:  ${session.sessionId}`,
+              `  status:         ${session.status}`,
+              `  model:          ${model}`,
+              `  context msgs:   ${msgs.length}`,
+              `  follow-up:      "${args.followupPrompt.slice(0, 100)}..."`,
+              ``,
+              `Track with get_droid("${session.sessionId}")`,
+            ].join("\n"),
+          },
+        ],
+      };
+    },
+  );
+
+  // ── 11. interrupt_droid ──────────────────────────────────────────
   server.registerTool(
     "interrupt_droid",
     {
