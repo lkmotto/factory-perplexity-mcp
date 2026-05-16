@@ -18,3 +18,11 @@ jobs:
         uses: cloudflare/wrangler-action@v3
         with:
           apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      - name: Set FACTORY_API_KEY secret
+        run: echo "${{ secrets.FACTORY_API_KEY }}" | npx wrangler secret put FACTORY_API_KEY
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      - name: Set MCP_AUTH_TOKEN secret
+        run: echo "${{ secrets.MCP_AUTH_TOKEN }}" | npx wrangler secret put MCP_AUTH_TOKEN
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
