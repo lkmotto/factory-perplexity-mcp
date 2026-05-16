@@ -419,7 +419,8 @@ function createMcpServer(apiKey: string): McpServer {
     "list_droids",
     {
       description:
-        "List recent droid sessions. Filter by status (idle, pending, running) and limit results.",
+        "List recent droid sessions with full session UUIDs, status, computer name, and metadata. " +
+        "Filter by status (idle, pending, running) and limit results.",
       inputSchema: {
         status: z
           .enum(["idle", "pending", "running"])
@@ -436,19 +437,30 @@ function createMcpServer(apiKey: string): McpServer {
       },
     },
     async (args) => {
-      let path = `/sessions?limit=${args.limit ?? 20}`;
-      const data = (await factoryFetch(path, apiKey)) as {
-        sessions: Array<{
-          sessionId: string;
-          title: string;
-          status: string;
-          createdAt: number;
-          messageCount: number;
-          computerId?: string;
-        }>;
-      };
+      // Parallel fetch sessions + computers (for name lookup)
+      const [sessionsData, computersData] = await Promise.all([
+        factoryFetch(`/sessions?limit=${args.limit ?? 20}`, apiKey) as Promise<{
+          sessions: Array<{
+            sessionId: string;
+            title: string;
+            status: string;
+            createdAt: number;
+            updatedAt?: number;
+            messageCount: number;
+            computerId?: string;
+          }>;
+        }>,
+        factoryFetch("/computers", apiKey) as Promise<{
+          computers: Array<{ id: string; name?: string; status: string }>;
+        }>,
+      ]);
 
-      let sessions = data.sessions;
+      // Build computer name lookup: id -> name
+      const computerNames = new Map<string, string>(
+        computersData.computers.map((c) => [c.id, c.name ?? c.id]),
+      );
+
+      let sessions = sessionsData.sessions;
       if (args.status) {
         sessions = sessions.filter((s) => s.status === args.status);
       }
@@ -459,19 +471,29 @@ function createMcpServer(apiKey: string): McpServer {
         };
       }
 
-      const lines = sessions.map((s) => {
+      const blocks = sessions.map((s, idx) => {
         const title =
-          (s.title ?? "untitled").slice(0, 60) +
-          ((s.title?.length ?? 0) > 60 ? "..." : "");
-        const date = new Date(s.createdAt).toISOString();
-        return `${s.sessionId}  [${s.status}]  ${title}  msgs=${s.messageCount}  ${date}`;
+          (s.title ?? "untitled").slice(0, 80) +
+          ((s.title?.length ?? 0) > 80 ? "..." : "");
+        const created = new Date(s.createdAt).toISOString();
+        const computerName = s.computerId
+          ? (computerNames.get(s.computerId) ?? "unknown")
+          : "?";
+        const computerLabel = s.computerId
+          ? `${computerName} (${s.computerId})`
+          : "?";
+        return [
+          `[${idx + 1}] id=${s.sessionId}  status=${s.status}  computer=${computerLabel}`,
+          `    msgs=${s.messageCount}  created=${created}`,
+          `    title: ${title}`,
+        ].join("\n");
       });
 
       return {
         content: [
           {
             type: "text",
-            text: `${sessions.length} droid(s):\n${lines.join("\n")}`,
+            text: `${sessions.length} droid session(s):\n\n${blocks.join("\n\n")}`,
           },
         ],
       };
@@ -562,50 +584,158 @@ function createMcpServer(apiKey: string): McpServer {
     "get_droid",
     {
       description:
-        "Get detailed status and recent messages for a specific droid session.",
+        "Get detailed status, full message history, tool execution timeline, current tool in use, " +
+        "timestamps per message, and running/pending sub-tasks for a specific droid session.",
       inputSchema: {
         sessionId: z.string().describe("The droid session ID to fetch"),
+        messageLimit: z
+          .number()
+          .int()
+          .min(1)
+          .max(500)
+          .optional()
+          .default(200)
+          .describe("Max messages to fetch (default 200, max 500)"),
       },
     },
     async (args) => {
-      const session = (await factoryFetch(
-        `/sessions/${args.sessionId}`,
-        apiKey,
-      )) as Record<string, unknown>;
+      type MsgBlock = Record<string, unknown>;
+      type Msg = {
+        id?: string;
+        role: string;
+        content: MsgBlock[] | unknown;
+        createdAt?: number;
+        updatedAt?: number;
+        parentId?: string;
+      };
 
-      const messages = (await factoryFetch(
-        `/sessions/${args.sessionId}/messages?limit=10`,
-        apiKey,
-      )) as { messages: Array<{ role: string; content: unknown }> };
+      const [session, messagesData] = await Promise.all([
+        factoryFetch(`/sessions/${args.sessionId}`, apiKey) as Promise<
+          Record<string, unknown>
+        >,
+        factoryFetch(
+          `/sessions/${args.sessionId}/messages?limit=${args.messageLimit ?? 200}`,
+          apiKey,
+        ) as Promise<{ messages: Msg[] }>,
+      ]);
 
-      const recentMsgs = (messages.messages ?? [])
-        .slice(-5)
-        .map(
-          (m: { role: string; content: unknown }) =>
-            `  [${m.role}] ${JSON.stringify(m.content).slice(0, 200)}`,
-        )
-        .join("\n");
-
+      const msgs = messagesData.messages ?? [];
       const ss = session.sessionSettings as Record<string, unknown> | undefined;
 
+      // Build tool execution timeline and track pending (in-progress) tool calls
+      const toolTimeline: string[] = [];
+      const pendingTools = new Map<
+        string,
+        { name: string; inputSummary: string; startedAt: string }
+      >();
+
+      for (const msg of msgs) {
+        const blocks = Array.isArray(msg.content) ? (msg.content as MsgBlock[]) : [];
+        const msgTs = msg.createdAt
+          ? new Date(msg.createdAt).toISOString()
+          : "?";
+
+        for (const block of blocks) {
+          if (block.type === "tool_use") {
+            const toolId = block.id as string;
+            const toolName = (block.name as string) ?? "unknown";
+            const inputSummary = JSON.stringify(block.input).slice(0, 150);
+            pendingTools.set(toolId, {
+              name: toolName,
+              inputSummary,
+              startedAt: msgTs,
+            });
+            toolTimeline.push(
+              `  ${msgTs}  [CALL]  ${toolName}  args=${inputSummary}`,
+            );
+          } else if (block.type === "tool_result") {
+            const toolUseId = block.toolUseId as string;
+            const pending = pendingTools.get(toolUseId);
+            if (pending) {
+              pendingTools.delete(toolUseId);
+              const errFlag = block.isError ? " (ERROR)" : "";
+              toolTimeline.push(
+                `  ${msgTs}  [DONE]  ${pending.name}${errFlag}`,
+              );
+            }
+          }
+        }
+      }
+
+      // Format full message history with timestamps and parsed content
+      const msgLines: string[] = [];
+      for (let i = 0; i < msgs.length; i++) {
+        const m = msgs[i];
+        const ts = m.createdAt
+          ? new Date(m.createdAt).toISOString()
+          : "unknown";
+        const blocks = Array.isArray(m.content)
+          ? (m.content as MsgBlock[])
+          : [];
+
+        const parts: string[] = [];
+        for (const block of blocks) {
+          if (block.type === "thinking") {
+            const snippet = ((block.thinking as string) ?? "").slice(0, 300);
+            parts.push(`<thinking>${snippet}${snippet.length >= 300 ? "..." : ""}</thinking>`);
+          } else if (block.type === "text") {
+            const text = ((block.text as string) ?? "").slice(0, 600);
+            parts.push(text);
+          } else if (block.type === "tool_use") {
+            parts.push(
+              `[tool_use: ${block.name}(${JSON.stringify(block.input).slice(0, 200)})]`,
+            );
+          } else if (block.type === "tool_result") {
+            const resultContent = JSON.stringify(
+              block.content ?? block.output,
+            ).slice(0, 300);
+            const errFlag = block.isError ? " ERROR" : "";
+            parts.push(`[tool_result${errFlag}: ${resultContent}]`);
+          }
+        }
+
+        msgLines.push(
+          `  [${i}] ${ts}  ${m.role}:\n    ${parts.join(" | ").slice(0, 800)}`,
+        );
+      }
+
+      // Assemble final output
+      const lines: string[] = [
+        `Droid ${args.sessionId}:`,
+        `  status:        ${session.status ?? "?"}`,
+        `  title:         ${((session.title as string) ?? "untitled").slice(0, 120)}`,
+        `  computer:      ${session.computerId ?? "?"}`,
+        `  model:         ${ss?.model ?? "?"}`,
+        `  messageCount:  ${session.messageCount ?? msgs.length}`,
+        `  createdAt:     ${new Date((session.createdAt as number) ?? 0).toISOString()}`,
+        `  updatedAt:     ${new Date((session.updatedAt as number) ?? 0).toISOString()}`,
+        ``,
+      ];
+
+      if (pendingTools.size > 0) {
+        lines.push(`Active/pending tools (${pendingTools.size}) — currently in progress:`);
+        for (const [, t] of pendingTools) {
+          lines.push(
+            `  [IN-PROGRESS] ${t.name}  started=${t.startedAt}  args=${t.inputSummary}`,
+          );
+        }
+        lines.push(``);
+      }
+
+      if (toolTimeline.length > 0) {
+        const shown = toolTimeline.slice(-40);
+        lines.push(
+          `Tool execution timeline (showing last ${shown.length} of ${toolTimeline.length} events):`,
+        );
+        lines.push(...shown);
+        lines.push(``);
+      }
+
+      lines.push(`Full message history (${msgs.length} messages):`);
+      lines.push(...msgLines);
+
       return {
-        content: [
-          {
-            type: "text",
-            text: [
-              `Droid ${args.sessionId}:`,
-              `  status:       ${session.status ?? "?"}`,
-              `  title:        ${(session.title as string) ?? "untitled"}`,
-              `  computer:     ${session.computerId ?? "?"}`,
-              `  model:        ${ss?.model ?? "?"}`,
-              `  messageCount: ${session.messageCount ?? "?"}`,
-              `  createdAt:    ${new Date((session.createdAt as number) ?? 0).toISOString()}`,
-              ``,
-              `Recent messages:`,
-              recentMsgs || "  (none)",
-            ].join("\n"),
-          },
-        ],
+        content: [{ type: "text", text: lines.join("\n") }],
       };
     },
   );

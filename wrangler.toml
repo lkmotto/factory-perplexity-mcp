@@ -2,6 +2,7 @@ name = "factory-perplexity-mcp"
 main = "src/index.ts"
 compatibility_date = "2025-05-14"
 compatibility_flags = ["nodejs_compat"]
+workers_dev = true
 
 [observability]
 enabled = true
