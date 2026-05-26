@@ -8,12 +8,15 @@ import { z } from "zod";
 interface Env {
   FACTORY_API_KEY: string;
   MCP_AUTH_TOKEN: string;
+  FACTORY_SHIM_URL: string;
+  FACTORY_SHIM_SECRET: string;
 }
 
 // ---------------------------------------------------------------------------
 // Factory API helpers
 // ---------------------------------------------------------------------------
 const FACTORY_BASE = "https://api.factory.ai/api/v0";
+const textEncoder = new TextEncoder();
 
 async function factoryFetch(
   path: string,
@@ -37,10 +40,159 @@ async function factoryFetch(
   return body;
 }
 
+function normalizeShimUrl(url: string): string {
+  return url.replace(/\/+$/, "");
+}
+
+function bufferToHex(buffer: ArrayBuffer): string {
+  return Array.from(new Uint8Array(buffer))
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
+}
+
+async function createShimSignature(rawBody: string, secret: string): Promise<string> {
+  const ts = Math.floor(Date.now() / 1000);
+  const key = await crypto.subtle.importKey(
+    "raw",
+    textEncoder.encode(secret),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"],
+  );
+  const signature = await crypto.subtle.sign(
+    "HMAC",
+    key,
+    textEncoder.encode(`${ts}.${rawBody}`),
+  );
+  return `t=${ts},v1=${bufferToHex(signature)}`;
+}
+
+async function shimHealthz(shimUrl: string): Promise<unknown> {
+  const res = await fetch(`${normalizeShimUrl(shimUrl)}/healthz`);
+  const body = await res.text();
+  if (!res.ok) {
+    throw new Error(`Shim /healthz ${res.status}: ${body.slice(0, 400)}`);
+  }
+  try {
+    return JSON.parse(body);
+  } catch {
+    return body;
+  }
+}
+
+async function shimExec(
+  shimUrl: string,
+  shimSecret: string,
+  payload: Record<string, unknown>,
+): Promise<{ output: string; done: unknown }> {
+  const rawBody = JSON.stringify(payload);
+  const signature = await createShimSignature(rawBody, shimSecret);
+  const res = await fetch(`${normalizeShimUrl(shimUrl)}/factory/exec`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "x-signature": signature,
+    },
+    body: rawBody,
+  });
+
+  if (!res.ok) {
+    const body = await res.text();
+    throw new Error(`Shim /factory/exec ${res.status}: ${body.slice(0, 400)}`);
+  }
+
+  if (!res.body) {
+    return { output: await res.text(), done: null };
+  }
+
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let event = "";
+  let dataLines: string[] = [];
+  let output = "";
+  let done: unknown = null;
+
+  const flushEvent = () => {
+    if (dataLines.length === 0) {
+      event = "";
+      return;
+    }
+    const raw = dataLines.join("\n");
+    let parsed: unknown = raw;
+    try {
+      parsed = JSON.parse(raw);
+    } catch {}
+
+    if (event === "chunk") {
+      if (
+        parsed &&
+        typeof parsed === "object" &&
+        "data" in parsed &&
+        typeof (parsed as { data?: unknown }).data === "string"
+      ) {
+        output += (parsed as { data: string }).data;
+      } else if (typeof parsed === "string") {
+        output += parsed;
+      } else {
+        output += `${JSON.stringify(parsed)}\n`;
+      }
+    } else if (event === "done") {
+      done = parsed;
+    }
+
+    event = "";
+    dataLines = [];
+  };
+
+  const processBufferedLines = (flushTail: boolean) => {
+    let idx = buffer.indexOf("\n");
+    while (idx >= 0) {
+      const rawLine = buffer.slice(0, idx);
+      buffer = buffer.slice(idx + 1);
+      const line = rawLine.endsWith("\r") ? rawLine.slice(0, -1) : rawLine;
+      if (line === "") {
+        flushEvent();
+      } else if (line.startsWith("event:")) {
+        event = line.slice(6).trim();
+      } else if (line.startsWith("data:")) {
+        dataLines.push(line.slice(5).trimStart());
+      }
+      idx = buffer.indexOf("\n");
+    }
+
+    if (flushTail && buffer.length > 0) {
+      const line = buffer.endsWith("\r") ? buffer.slice(0, -1) : buffer;
+      if (line.startsWith("event:")) {
+        event = line.slice(6).trim();
+      } else if (line.startsWith("data:")) {
+        dataLines.push(line.slice(5).trimStart());
+      }
+      buffer = "";
+      flushEvent();
+    }
+  };
+
+  while (true) {
+    const chunk = await reader.read();
+    if (chunk.done) break;
+    buffer += decoder.decode(chunk.value, { stream: true });
+    processBufferedLines(false);
+  }
+  buffer += decoder.decode();
+  processBufferedLines(true);
+
+  return { output, done };
+}
+
 // ---------------------------------------------------------------------------
 // MCP Server factory – creates a fresh server + tools on every request
 // ---------------------------------------------------------------------------
-function createMcpServer(apiKey: string): McpServer {
+function createMcpServer(
+  apiKey: string,
+  shimUrl: string,
+  shimSecret: string,
+): McpServer {
   const server = new McpServer(
     { name: "factory-perplexity-mcp", version: "1.0.0" },
     {
@@ -969,6 +1121,89 @@ function createMcpServer(apiKey: string): McpServer {
     },
   );
 
+  // ── 12. factory_exec ─────────────────────────────────────────────
+  server.registerTool(
+    "factory_exec",
+    {
+      description:
+        "Execute a prompt through the Legion Factory CLI shim and stream output text.",
+      inputSchema: {
+        prompt: z.string().describe("Prompt to execute via the shim"),
+        cwd: z
+          .string()
+          .optional()
+          .describe("Optional working directory hint forwarded to the shim"),
+        auto: z
+          .enum(["high", "medium", "off"])
+          .optional()
+          .describe("Auto mode mapping: high=auto-high, medium=auto-medium, off=normal"),
+        mission: z
+          .string()
+          .optional()
+          .describe("Optional mission/session identifier forwarded as session_id"),
+      },
+    },
+    async (args) => {
+      if (!shimUrl || !shimSecret) {
+        throw new Error("Missing FACTORY_SHIM_URL or FACTORY_SHIM_SECRET");
+      }
+
+      const mode =
+        args.auto === "medium"
+          ? "auto-medium"
+          : args.auto === "off"
+            ? "normal"
+            : "auto-high";
+
+      const payload: Record<string, unknown> = {
+        prompt: args.prompt,
+        mode,
+      };
+      if (args.cwd) payload.cwd = args.cwd;
+      if (args.mission) {
+        payload.mission = args.mission;
+        payload.session_id = args.mission;
+      }
+
+      const result = await shimExec(shimUrl, shimSecret, payload);
+      const output = result.output.trim().length > 0
+        ? result.output
+        : "(shim returned no streamed output)";
+      const doneSuffix = result.done ? `\n\n[done] ${JSON.stringify(result.done)}` : "";
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: `${output}${doneSuffix}`,
+          },
+        ],
+      };
+    },
+  );
+
+  // ── 13. factory_healthz ──────────────────────────────────────────
+  server.registerTool(
+    "factory_healthz",
+    {
+      description: "Check Legion shim /healthz status.",
+    },
+    async () => {
+      if (!shimUrl) {
+        throw new Error("Missing FACTORY_SHIM_URL");
+      }
+      const health = await shimHealthz(shimUrl);
+      return {
+        content: [
+          {
+            type: "text",
+            text: typeof health === "string" ? health : JSON.stringify(health),
+          },
+        ],
+      };
+    },
+  );
+
   return server;
 }
 
@@ -1065,7 +1300,11 @@ export default {
 
     // Build MCP server + transport (stateless — no sessionIdGenerator)
     try {
-      const server = createMcpServer(env.FACTORY_API_KEY);
+      const server = createMcpServer(
+        env.FACTORY_API_KEY,
+        env.FACTORY_SHIM_URL,
+        env.FACTORY_SHIM_SECRET,
+      );
       const transport = new WebStandardStreamableHTTPServerTransport();
 
       await server.connect(transport);

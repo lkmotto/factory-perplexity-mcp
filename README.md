@@ -7,6 +7,8 @@ A [FastMCP](https://github.com/modelcontextprotocol) server that wraps the [Fact
 1. **Environment secrets** (set via `wrangler secret put`):
    - `FACTORY_API_KEY` — Your Factory.ai API key (stored in Doppler)
    - `MCP_AUTH_TOKEN` — Bearer token clients must present to access the MCP endpoint
+   - `FACTORY_SHIM_URL` — Base URL for the Legion shim (e.g. `https://<...>.trycloudflare.com`)
+   - `FACTORY_SHIM_SECRET` — Shared HMAC secret used to sign shim requests
 
 2. **Deploy** (Cloudflare Workers):
    ```bash
@@ -89,6 +91,18 @@ Continue a dead (idle) session by fetching its full message log and spawning a N
 ### 11. `interrupt_droid`
 Interrupt a running droid session. Idempotent — safe to call on already-idle droids.
 - `sessionId` (string, required) — Droid session ID to interrupt.
+
+### 12. `factory_exec` (NEW)
+Execute a prompt through the Legion shim endpoint (`POST /factory/exec`) with HMAC-SHA256 request signing and streamed SSE output aggregation.
+- `prompt` (string, required) — Prompt to execute.
+- `cwd` (string, optional) — Working directory hint forwarded to shim.
+- `auto` (enum, optional) — `high`, `medium`, `off` (mapped to shim modes `auto-high`, `auto-medium`, `normal`).
+- `mission` (string, optional) — Forwarded as `mission` and `session_id` for mission/session continuity.
+
+### 13. `factory_healthz` (NEW)
+Call Legion shim health endpoint (`GET /healthz`).
+- No parameters.
+- Returns raw shim health JSON/text.
 
 ## Factory API
 
