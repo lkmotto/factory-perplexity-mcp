@@ -398,54 +398,9 @@ async function validateBearerToken(
   return kvGetJson<AccessTokenRecord>(env.MCP_CLIENTS, accessTokenKey(bearerToken));
 }
 
-function redactTokenValue(value: string): string {
-  if (!value) return "";
-  if (value.length <= 10) return `${value.slice(0, 2)}...${value.slice(-2)}`;
-  return `${value.slice(0, 6)}...${value.slice(-4)}`;
-}
-
-function sanitizeDebugHeaderValue(name: string, value: string): string {
-  if (name !== "authorization") return value;
-  const match = value.match(/^(\S+)\s+(.+)$/);
-  if (!match) return redactTokenValue(value);
-  return `${match[1]} ${redactTokenValue(match[2])}`;
-}
-
-async function logMcpDebugRequest(
-  request: Request,
-  endpoint: "mcp" | "register" | "authorize" | "token",
-): Promise<void> {
-  const headers: Record<string, string> = {};
-  for (const [name, value] of request.headers.entries()) {
-    const key = name.toLowerCase();
-    headers[key] = sanitizeDebugHeaderValue(key, value);
-  }
-
-  let body = "";
-  try {
-    body = await request.clone().text();
-  } catch {
-    body = "[unavailable]";
-  }
-  if (body.length > 2000) body = `${body.slice(0, 2000)}...[truncated]`;
-
-  console.log(
-    `MCP_DEBUG ${JSON.stringify({
-      endpoint,
-      method: request.method,
-      url: request.url,
-      headers,
-      body,
-      timestamp: new Date().toISOString(),
-    })}`,
-  );
-}
-
 function wantsJsonMcpResponse(request: Request): boolean {
   const accept = request.headers.get("Accept");
-  if (!accept || accept.trim().length === 0) return true;
-  const acceptsSse = accept.toLowerCase().includes("text/event-stream");
-  return !acceptsSse;
+  return !accept || accept.toLowerCase().includes("application/json");
 }
 
 async function convertSseToJsonRpcResponse(response: Response): Promise<Response> {
@@ -1622,7 +1577,6 @@ export default {
     }
 
     if (url.pathname === "/register") {
-      await logMcpDebugRequest(request, "register");
       if (request.method !== "POST") {
         return addCors(new Response("Method Not Allowed", { status: 405 }), origin);
       }
@@ -1762,7 +1716,6 @@ export default {
     }
 
     if (url.pathname === "/authorize") {
-      await logMcpDebugRequest(request, "authorize");
       if (request.method !== "GET") {
         return addCors(new Response("Method Not Allowed", { status: 405 }), origin);
       }
@@ -1879,7 +1832,6 @@ export default {
     }
 
     if (url.pathname === "/token") {
-      await logMcpDebugRequest(request, "token");
       if (request.method !== "POST") {
         return addCors(new Response("Method Not Allowed", { status: 405 }), origin);
       }
@@ -2122,7 +2074,6 @@ export default {
     if (url.pathname !== "/mcp") {
       return addCors(new Response("Not Found", { status: 404 }), origin);
     }
-    await logMcpDebugRequest(request, "mcp");
 
     // Auth check — OAuth bearer access_token (stored in KV)
     const authHeader = request.headers.get("Authorization") ?? "";
