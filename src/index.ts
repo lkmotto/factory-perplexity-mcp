@@ -185,7 +185,7 @@ async function shimExec(
   return { output, done };
 }
 
-type TokenEndpointAuthMethod = "none" | "client_secret_post";
+type TokenEndpointAuthMethod = "client_secret_post" | "client_secret_basic";
 
 type RegisteredClient = {
   clientId: string;
@@ -343,7 +343,10 @@ function oauthMetadata(origin: string): Record<string, unknown> {
     grant_types_supported: ["authorization_code", "refresh_token"],
     code_challenge_methods_supported: ["S256"],
     scopes_supported: [OAUTH_SCOPE_DEFAULT],
-    token_endpoint_auth_methods_supported: ["none", "client_secret_post"],
+    token_endpoint_auth_methods_supported: [
+      "client_secret_post",
+      "client_secret_basic",
+    ],
   };
 }
 
@@ -367,6 +370,25 @@ async function parseTokenRequestParams(request: Request): Promise<URLSearchParam
     return params;
   }
   return new URLSearchParams(await request.text());
+}
+
+function parseBasicClientCredentials(
+  authHeader: string | null,
+): { clientId: string; clientSecret: string } | null {
+  if (!authHeader || !/^Basic\s+/i.test(authHeader)) return null;
+  const encoded = authHeader.replace(/^Basic\s+/i, "").trim();
+  if (!encoded) return null;
+  try {
+    const decoded = atob(encoded);
+    const separator = decoded.indexOf(":");
+    if (separator < 0) return null;
+    const clientId = decoded.slice(0, separator);
+    const clientSecret = decoded.slice(separator + 1);
+    if (!clientId || !clientSecret) return null;
+    return { clientId, clientSecret };
+  } catch {
+    return null;
+  }
 }
 
 async function validateBearerToken(
@@ -1531,16 +1553,16 @@ export default {
 
       const tokenEndpointAuthMethod = (typeof body.token_endpoint_auth_method === "string"
         ? body.token_endpoint_auth_method
-        : "none") as TokenEndpointAuthMethod;
+        : "client_secret_post") as TokenEndpointAuthMethod;
       if (
-        tokenEndpointAuthMethod !== "none" &&
-        tokenEndpointAuthMethod !== "client_secret_post"
+        tokenEndpointAuthMethod !== "client_secret_post" &&
+        tokenEndpointAuthMethod !== "client_secret_basic"
       ) {
         return addCors(
           oauthErrorResponse(
             "invalid_client_metadata",
             400,
-            "token_endpoint_auth_method must be none or client_secret_post",
+            "token_endpoint_auth_method must be client_secret_post or client_secret_basic",
           ),
           origin,
         );
@@ -1589,15 +1611,12 @@ export default {
       }
 
       const clientId = crypto.randomUUID();
-      const clientSecret =
-        tokenEndpointAuthMethod === "client_secret_post"
-          ? randomOpaqueToken(32)
-          : undefined;
+      const clientSecret = randomOpaqueToken(32);
       const now = Math.floor(Date.now() / 1000);
 
       const client: RegisteredClient = {
         clientId,
-        ...(clientSecret ? { clientSecret } : {}),
+        clientSecret,
         clientName: typeof body.client_name === "string" ? body.client_name : undefined,
         redirectUris,
         tokenEndpointAuthMethod,
@@ -1613,7 +1632,7 @@ export default {
       return addCors(
         jsonResponse(201, {
           client_id: client.clientId,
-          ...(client.clientSecret ? { client_secret: client.clientSecret } : {}),
+          client_secret: client.clientSecret,
           client_id_issued_at: client.clientIdIssuedAt,
           client_secret_expires_at: client.clientSecretExpiresAt,
           redirect_uris: client.redirectUris,
@@ -1758,7 +1777,24 @@ export default {
       }
 
       const grantType = params.get("grant_type");
-      const clientId = params.get("client_id");
+      const bodyClientId = params.get("client_id");
+      const bodyClientSecret = params.get("client_secret");
+      const basicCredentials = parseBasicClientCredentials(
+        request.headers.get("Authorization"),
+      );
+      if (request.headers.has("Authorization") && !basicCredentials) {
+        return addCors(
+          oauthErrorResponse(
+            "invalid_client",
+            401,
+            "Malformed Authorization header for client_secret_basic",
+          ),
+          origin,
+        );
+      }
+
+      const clientId = basicCredentials?.clientId ?? bodyClientId;
+      const presentedClientSecret = basicCredentials?.clientSecret ?? bodyClientSecret;
       if (!grantType) {
         return addCors(
           oauthErrorResponse("invalid_request", 400, "grant_type is required"),
@@ -1768,6 +1804,12 @@ export default {
       if (!clientId) {
         return addCors(
           oauthErrorResponse("invalid_client", 401, "client_id is required"),
+          origin,
+        );
+      }
+      if (basicCredentials && bodyClientId && bodyClientId !== basicCredentials.clientId) {
+        return addCors(
+          oauthErrorResponse("invalid_client", 401, "client_id mismatch between body and basic auth"),
           origin,
         );
       }
@@ -1783,14 +1825,18 @@ export default {
         );
       }
 
-      if (client.tokenEndpointAuthMethod === "client_secret_post") {
-        const clientSecret = params.get("client_secret");
-        if (!clientSecret || clientSecret !== client.clientSecret) {
-          return addCors(
-            oauthErrorResponse("invalid_client", 401, "Invalid client_secret"),
-            origin,
-          );
-        }
+      if (!presentedClientSecret) {
+        return addCors(
+          oauthErrorResponse("invalid_client", 401, "client_secret is required"),
+          origin,
+        );
+      }
+
+      if (!client.clientSecret || presentedClientSecret !== client.clientSecret) {
+        return addCors(
+          oauthErrorResponse("invalid_client", 401, "Invalid client_secret"),
+          origin,
+        );
       }
 
       if (grantType === "authorization_code") {

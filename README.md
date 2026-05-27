@@ -29,10 +29,10 @@ This worker now exposes a minimal authorization server for Perplexity custom MCP
 
 Flow:
 1. Connector reads OAuth metadata from `/.well-known/oauth-authorization-server`.
-2. Connector dynamically registers with `POST /register` and receives `client_id` (and optional `client_secret`).
+2. Connector dynamically registers with `POST /register` and receives `client_id` + `client_secret` (confidential client default: `token_endpoint_auth_method=client_secret_post`).
 3. Connector sends user to `GET /authorize` with PKCE (`code_challenge_method=S256`).
 4. Worker auto-approves (single-user mode) and redirects with `code`.
-5. Connector exchanges code at `POST /token` for `access_token` + `refresh_token`.
+5. Connector exchanges code at `POST /token` for `access_token` + `refresh_token` using either `client_secret_post` (form body) or `client_secret_basic` (HTTP Basic auth).
 6. `POST /mcp` requires `Authorization: Bearer <access_token>` and validates token from KV.
 
 The shim HMAC flow (`factory_exec` -> `FACTORY_SHIM_URL`) is unchanged.
