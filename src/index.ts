@@ -398,6 +398,78 @@ async function validateBearerToken(
   return kvGetJson<AccessTokenRecord>(env.MCP_CLIENTS, accessTokenKey(bearerToken));
 }
 
+function wantsJsonMcpResponse(request: Request): boolean {
+  const accept = request.headers.get("Accept");
+  if (!accept || accept.trim().length === 0) return true;
+  const acceptsSse = accept.toLowerCase().includes("text/event-stream");
+  return !acceptsSse;
+}
+
+async function convertSseToJsonRpcResponse(response: Response): Promise<Response> {
+  const contentType = (response.headers.get("Content-Type") ?? "").toLowerCase();
+  if (!contentType.includes("text/event-stream")) return response;
+
+  const sseBody = await response.text();
+  const lines = sseBody.split(/\r?\n/);
+  let event = "";
+  let dataLines: string[] = [];
+  let firstPayload: unknown = null;
+
+  const flushEvent = () => {
+    if (dataLines.length === 0 || firstPayload !== null) {
+      event = "";
+      dataLines = [];
+      return;
+    }
+    if (event && event !== "message") {
+      event = "";
+      dataLines = [];
+      return;
+    }
+
+    const raw = dataLines.join("\n");
+    try {
+      firstPayload = JSON.parse(raw);
+    } catch {
+      firstPayload = {
+        jsonrpc: "2.0",
+        error: { code: -32700, message: "Parse error: Invalid JSON" },
+        id: null,
+      };
+    }
+    event = "";
+    dataLines = [];
+  };
+
+  for (const line of lines) {
+    if (line === "") {
+      flushEvent();
+      continue;
+    }
+    if (line.startsWith("event:")) {
+      event = line.slice(6).trim();
+    } else if (line.startsWith("data:")) {
+      dataLines.push(line.slice(5).trimStart());
+    }
+  }
+  flushEvent();
+
+  const payload = firstPayload ?? {
+    jsonrpc: "2.0",
+    error: { code: -32000, message: "Empty MCP SSE response" },
+    id: null,
+  };
+
+  return new Response(JSON.stringify(payload), {
+    status: response.status,
+    statusText: response.statusText,
+    headers: {
+      "Content-Type": "application/json",
+      "Cache-Control": "no-cache",
+    },
+  });
+}
+
 // ---------------------------------------------------------------------------
 // MCP Server factory – creates a fresh server + tools on every request
 // ---------------------------------------------------------------------------
@@ -2051,9 +2123,20 @@ export default {
         env.FACTORY_SHIM_SECRET,
       );
       const transport = new WebStandardStreamableHTTPServerTransport();
+      const jsonOnlyMode = wantsJsonMcpResponse(request);
+
+      // Compatibility: some MCP clients (including Perplexity) send Accept: application/json only.
+      // We still route through Streamable HTTP transport, then convert SSE payload to JSON when needed.
+      const forwardedHeaders = new Headers(request.headers);
+      forwardedHeaders.set("Accept", "application/json, text/event-stream");
+      const forwardedRequest = new Request(request, { headers: forwardedHeaders });
 
       await server.connect(transport);
-      const mcpResponse = await transport.handleRequest(request);
+      const mcpResponse = await transport.handleRequest(forwardedRequest);
+      if (jsonOnlyMode) {
+        const jsonMcpResponse = await convertSseToJsonRpcResponse(mcpResponse);
+        return addCors(jsonMcpResponse, origin);
+      }
       return addCors(mcpResponse, origin);
     } catch (err) {
       console.error("MCP handler error:", err);
