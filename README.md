@@ -6,9 +6,9 @@ A [FastMCP](https://github.com/modelcontextprotocol) server that wraps the [Fact
 
 1. **Environment secrets** (set via `wrangler secret put`):
    - `FACTORY_API_KEY` — Your Factory.ai API key (stored in Doppler)
-   - `MCP_AUTH_TOKEN` — Bearer token clients must present to access the MCP endpoint
    - `FACTORY_SHIM_URL` — Base URL for the Legion shim (e.g. `https://<...>.trycloudflare.com`)
    - `FACTORY_SHIM_SECRET` — Shared HMAC secret used to sign shim requests
+   - `MCP_CLIENTS` — KV namespace binding for registered OAuth clients, auth codes, and tokens
 
 2. **Deploy** (Cloudflare Workers):
    ```bash
@@ -17,12 +17,25 @@ A [FastMCP](https://github.com/modelcontextprotocol) server that wraps the [Fact
 
 3. **Endpoint**: `https://<your-worker>.workers.dev/mcp`
 
-## Authentication
+## OAuth 2.1 + Dynamic Client Registration (RFC 7591)
 
-All MCP requests must include:
-```
-Authorization: Bearer <MCP_AUTH_TOKEN>
-```
+This worker now exposes a minimal authorization server for Perplexity custom MCP connectors:
+
+- `GET /.well-known/oauth-authorization-server`
+- `GET /.well-known/oauth-protected-resource`
+- `POST /register`
+- `GET /authorize` (single-user auto-approve mode)
+- `POST /token`
+
+Flow:
+1. Connector reads OAuth metadata from `/.well-known/oauth-authorization-server`.
+2. Connector dynamically registers with `POST /register` and receives `client_id` (and optional `client_secret`).
+3. Connector sends user to `GET /authorize` with PKCE (`code_challenge_method=S256`).
+4. Worker auto-approves (single-user mode) and redirects with `code`.
+5. Connector exchanges code at `POST /token` for `access_token` + `refresh_token`.
+6. `POST /mcp` requires `Authorization: Bearer <access_token>` and validates token from KV.
+
+The shim HMAC flow (`factory_exec` -> `FACTORY_SHIM_URL`) is unchanged.
 
 ## Tools
 

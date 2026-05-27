@@ -4,6 +4,10 @@ compatibility_date = "2025-05-14"
 compatibility_flags = ["nodejs_compat"]
 workers_dev = true
 
+[[kv_namespaces]]
+binding = "MCP_CLIENTS"
+id = "bc0baa2a4801448695cae44a58a97473"
+
 [observability]
 enabled = true
 head_sampling_rate = 1

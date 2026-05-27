@@ -7,9 +7,9 @@ import { z } from "zod";
 // ---------------------------------------------------------------------------
 interface Env {
   FACTORY_API_KEY: string;
-  MCP_AUTH_TOKEN: string;
   FACTORY_SHIM_URL: string;
   FACTORY_SHIM_SECRET: string;
+  MCP_CLIENTS: KVNamespace;
 }
 
 // ---------------------------------------------------------------------------
@@ -183,6 +183,197 @@ async function shimExec(
   processBufferedLines(true);
 
   return { output, done };
+}
+
+type TokenEndpointAuthMethod = "none" | "client_secret_post";
+
+type RegisteredClient = {
+  clientId: string;
+  clientSecret?: string;
+  clientName?: string;
+  redirectUris: string[];
+  tokenEndpointAuthMethod: TokenEndpointAuthMethod;
+  grantTypes: string[];
+  responseTypes: string[];
+  scope: string;
+  clientIdIssuedAt: number;
+  clientSecretExpiresAt: number;
+};
+
+type AuthorizationCodeRecord = {
+  clientId: string;
+  redirectUri: string;
+  codeChallenge: string;
+  codeChallengeMethod: "S256";
+  scope: string;
+  issuedAt: number;
+};
+
+type AccessTokenRecord = {
+  clientId: string;
+  scope: string;
+  issuedAt: number;
+};
+
+type RefreshTokenRecord = {
+  clientId: string;
+  scope: string;
+  issuedAt: number;
+};
+
+const OAUTH_SCOPE_DEFAULT = "mcp";
+const AUTH_CODE_TTL_SECONDS = 60;
+const ACCESS_TOKEN_TTL_SECONDS = 3600;
+const REFRESH_TOKEN_TTL_SECONDS = 60 * 60 * 24 * 30;
+
+function clientKey(clientId: string): string {
+  return `oauth:client:${clientId}`;
+}
+
+function authCodeKey(code: string): string {
+  return `oauth:code:${code}`;
+}
+
+function accessTokenKey(accessToken: string): string {
+  return `oauth:token:${accessToken}`;
+}
+
+function refreshTokenKey(refreshToken: string): string {
+  return `oauth:refresh:${refreshToken}`;
+}
+
+function jsonResponse(
+  status: number,
+  body: unknown,
+  headers?: Record<string, string>,
+): Response {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: {
+      "Content-Type": "application/json",
+      "Cache-Control": "no-store",
+      Pragma: "no-cache",
+      ...(headers ?? {}),
+    },
+  });
+}
+
+function oauthErrorResponse(
+  error: string,
+  status = 400,
+  description?: string,
+): Response {
+  return jsonResponse(status, {
+    error,
+    ...(description ? { error_description: description } : {}),
+  });
+}
+
+function oauthRedirectError(
+  redirectUri: string | null,
+  state: string | null,
+  error: string,
+  description: string,
+): Response {
+  if (!redirectUri) {
+    return oauthErrorResponse(error, 400, description);
+  }
+  const redirect = new URL(redirectUri);
+  redirect.searchParams.set("error", error);
+  redirect.searchParams.set("error_description", description);
+  if (state) redirect.searchParams.set("state", state);
+  return new Response(null, {
+    status: 302,
+    headers: { Location: redirect.toString() },
+  });
+}
+
+async function kvGetJson<T>(
+  kv: KVNamespace,
+  key: string,
+): Promise<T | null> {
+  const value = await kv.get(key);
+  if (!value) return null;
+  return JSON.parse(value) as T;
+}
+
+function uint8ToBase64Url(bytes: Uint8Array): string {
+  let binary = "";
+  for (const b of bytes) {
+    binary += String.fromCharCode(b);
+  }
+  return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
+}
+
+function randomOpaqueToken(byteLength = 32): string {
+  const bytes = new Uint8Array(byteLength);
+  crypto.getRandomValues(bytes);
+  return uint8ToBase64Url(bytes);
+}
+
+async function sha256Base64Url(input: string): Promise<string> {
+  const digest = await crypto.subtle.digest("SHA-256", textEncoder.encode(input));
+  return uint8ToBase64Url(new Uint8Array(digest));
+}
+
+function normalizeScope(scope: string | null | undefined): string {
+  return scope && scope.trim().length > 0 ? scope.trim() : OAUTH_SCOPE_DEFAULT;
+}
+
+function scopeSet(scope: string): Set<string> {
+  return new Set(scope.split(/\s+/).filter(Boolean));
+}
+
+function isScopeSubset(requestedScope: string, allowedScope: string): boolean {
+  const requested = scopeSet(requestedScope);
+  const allowed = scopeSet(allowedScope);
+  for (const s of requested) {
+    if (!allowed.has(s)) return false;
+  }
+  return true;
+}
+
+function oauthMetadata(origin: string): Record<string, unknown> {
+  return {
+    issuer: origin,
+    authorization_endpoint: `${origin}/authorize`,
+    token_endpoint: `${origin}/token`,
+    registration_endpoint: `${origin}/register`,
+    response_types_supported: ["code"],
+    grant_types_supported: ["authorization_code", "refresh_token"],
+    code_challenge_methods_supported: ["S256"],
+    scopes_supported: [OAUTH_SCOPE_DEFAULT],
+    token_endpoint_auth_methods_supported: ["none", "client_secret_post"],
+  };
+}
+
+function oauthProtectedResourceMetadata(origin: string): Record<string, unknown> {
+  return {
+    resource: `${origin}/mcp`,
+    authorization_servers: [origin],
+    scopes_supported: [OAUTH_SCOPE_DEFAULT],
+    bearer_methods_supported: ["header"],
+  };
+}
+
+async function parseTokenRequestParams(request: Request): Promise<URLSearchParams> {
+  const contentType = request.headers.get("Content-Type") ?? "";
+  if (contentType.includes("application/json")) {
+    const body = (await request.json()) as Record<string, unknown>;
+    const params = new URLSearchParams();
+    for (const [k, v] of Object.entries(body)) {
+      if (typeof v === "string") params.set(k, v);
+    }
+    return params;
+  }
+  return new URLSearchParams(await request.text());
+}
+
+async function validateBearerToken(
+  env: Env,
+  bearerToken: string,
+): Promise<AccessTokenRecord | null> {
+  return kvGetJson<AccessTokenRecord>(env.MCP_CLIENTS, accessTokenKey(bearerToken));
 }
 
 // ---------------------------------------------------------------------------
@@ -1255,6 +1446,7 @@ export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
     const origin = request.headers.get("Origin");
+    const issuer = url.origin;
 
     // CORS preflight
     if (request.method === "OPTIONS") {
@@ -1275,25 +1467,532 @@ export default {
       );
     }
 
+    if (
+      request.method === "GET" &&
+      url.pathname === "/.well-known/oauth-authorization-server"
+    ) {
+      return addCors(jsonResponse(200, oauthMetadata(issuer)), origin);
+    }
+
+    if (
+      request.method === "GET" &&
+      url.pathname === "/.well-known/oauth-protected-resource"
+    ) {
+      return addCors(
+        jsonResponse(200, oauthProtectedResourceMetadata(issuer)),
+        origin,
+      );
+    }
+
+    if (url.pathname === "/register") {
+      if (request.method !== "POST") {
+        return addCors(new Response("Method Not Allowed", { status: 405 }), origin);
+      }
+
+      let bodyUnknown: unknown;
+      try {
+        bodyUnknown = await request.json();
+      } catch {
+        return addCors(
+          oauthErrorResponse(
+            "invalid_client_metadata",
+            400,
+            "Registration request body must be JSON",
+          ),
+          origin,
+        );
+      }
+
+      if (
+        !bodyUnknown ||
+        typeof bodyUnknown !== "object" ||
+        Array.isArray(bodyUnknown)
+      ) {
+        return addCors(
+          oauthErrorResponse("invalid_client_metadata", 400, "Invalid JSON body"),
+          origin,
+        );
+      }
+      const body = bodyUnknown as Record<string, unknown>;
+
+      const redirectUris = Array.isArray(body.redirect_uris)
+        ? body.redirect_uris.filter((v): v is string => typeof v === "string")
+        : [];
+      if (redirectUris.length === 0) {
+        return addCors(
+          oauthErrorResponse(
+            "invalid_client_metadata",
+            400,
+            "redirect_uris must contain at least one URI",
+          ),
+          origin,
+        );
+      }
+
+      const tokenEndpointAuthMethod = (typeof body.token_endpoint_auth_method === "string"
+        ? body.token_endpoint_auth_method
+        : "none") as TokenEndpointAuthMethod;
+      if (
+        tokenEndpointAuthMethod !== "none" &&
+        tokenEndpointAuthMethod !== "client_secret_post"
+      ) {
+        return addCors(
+          oauthErrorResponse(
+            "invalid_client_metadata",
+            400,
+            "token_endpoint_auth_method must be none or client_secret_post",
+          ),
+          origin,
+        );
+      }
+
+      const grantTypes = Array.isArray(body.grant_types)
+        ? body.grant_types.filter((v): v is string => typeof v === "string")
+        : ["authorization_code", "refresh_token"];
+      if (!grantTypes.includes("authorization_code")) {
+        return addCors(
+          oauthErrorResponse(
+            "invalid_client_metadata",
+            400,
+            "authorization_code grant_type is required",
+          ),
+          origin,
+        );
+      }
+
+      const responseTypes = Array.isArray(body.response_types)
+        ? body.response_types.filter((v): v is string => typeof v === "string")
+        : ["code"];
+      if (!responseTypes.includes("code")) {
+        return addCors(
+          oauthErrorResponse(
+            "invalid_client_metadata",
+            400,
+            "response_types must include code",
+          ),
+          origin,
+        );
+      }
+
+      const requestedScope = normalizeScope(
+        typeof body.scope === "string" ? body.scope : OAUTH_SCOPE_DEFAULT,
+      );
+      if (!isScopeSubset(requestedScope, OAUTH_SCOPE_DEFAULT)) {
+        return addCors(
+          oauthErrorResponse(
+            "invalid_client_metadata",
+            400,
+            `scope must be within "${OAUTH_SCOPE_DEFAULT}"`,
+          ),
+          origin,
+        );
+      }
+
+      const clientId = crypto.randomUUID();
+      const clientSecret =
+        tokenEndpointAuthMethod === "client_secret_post"
+          ? randomOpaqueToken(32)
+          : undefined;
+      const now = Math.floor(Date.now() / 1000);
+
+      const client: RegisteredClient = {
+        clientId,
+        ...(clientSecret ? { clientSecret } : {}),
+        clientName: typeof body.client_name === "string" ? body.client_name : undefined,
+        redirectUris,
+        tokenEndpointAuthMethod,
+        grantTypes,
+        responseTypes,
+        scope: requestedScope,
+        clientIdIssuedAt: now,
+        clientSecretExpiresAt: 0,
+      };
+
+      await env.MCP_CLIENTS.put(clientKey(clientId), JSON.stringify(client));
+
+      return addCors(
+        jsonResponse(201, {
+          client_id: client.clientId,
+          ...(client.clientSecret ? { client_secret: client.clientSecret } : {}),
+          client_id_issued_at: client.clientIdIssuedAt,
+          client_secret_expires_at: client.clientSecretExpiresAt,
+          redirect_uris: client.redirectUris,
+          token_endpoint_auth_method: client.tokenEndpointAuthMethod,
+          grant_types: client.grantTypes,
+          response_types: client.responseTypes,
+          scope: client.scope,
+        }),
+        origin,
+      );
+    }
+
+    if (url.pathname === "/authorize") {
+      if (request.method !== "GET") {
+        return addCors(new Response("Method Not Allowed", { status: 405 }), origin);
+      }
+
+      const responseType = url.searchParams.get("response_type");
+      const clientId = url.searchParams.get("client_id");
+      const redirectUri = url.searchParams.get("redirect_uri");
+      const state = url.searchParams.get("state");
+      const codeChallenge = url.searchParams.get("code_challenge");
+      const codeChallengeMethod = url.searchParams.get("code_challenge_method");
+
+      if (!clientId) {
+        return addCors(
+          oauthErrorResponse("invalid_request", 400, "client_id is required"),
+          origin,
+        );
+      }
+      const client = await kvGetJson<RegisteredClient>(
+        env.MCP_CLIENTS,
+        clientKey(clientId),
+      );
+      if (!client) {
+        return addCors(
+          oauthErrorResponse("unauthorized_client", 400, "Unknown client_id"),
+          origin,
+        );
+      }
+
+      if (!redirectUri || !client.redirectUris.includes(redirectUri)) {
+        return addCors(
+          oauthErrorResponse(
+            "invalid_request",
+            400,
+            "redirect_uri is missing or not registered for this client",
+          ),
+          origin,
+        );
+      }
+
+      if (responseType !== "code") {
+        return addCors(
+          oauthRedirectError(
+            redirectUri,
+            state,
+            "unsupported_response_type",
+            "Only response_type=code is supported",
+          ),
+          origin,
+        );
+      }
+
+      if (!codeChallenge || !codeChallengeMethod) {
+        return addCors(
+          oauthRedirectError(
+            redirectUri,
+            state,
+            "invalid_request",
+            "code_challenge and code_challenge_method are required",
+          ),
+          origin,
+        );
+      }
+
+      if (codeChallengeMethod !== "S256") {
+        return addCors(
+          oauthRedirectError(
+            redirectUri,
+            state,
+            "invalid_request",
+            "Only S256 code_challenge_method is supported",
+          ),
+          origin,
+        );
+      }
+
+      const requestedScope = normalizeScope(url.searchParams.get("scope") ?? client.scope);
+      if (!isScopeSubset(requestedScope, client.scope)) {
+        return addCors(
+          oauthRedirectError(
+            redirectUri,
+            state,
+            "invalid_scope",
+            "Requested scope is not allowed for this client",
+          ),
+          origin,
+        );
+      }
+
+      const authorizationCode = randomOpaqueToken(24);
+      const codeRecord: AuthorizationCodeRecord = {
+        clientId,
+        redirectUri,
+        codeChallenge,
+        codeChallengeMethod: "S256",
+        scope: requestedScope,
+        issuedAt: Math.floor(Date.now() / 1000),
+      };
+      await env.MCP_CLIENTS.put(
+        authCodeKey(authorizationCode),
+        JSON.stringify(codeRecord),
+        { expirationTtl: AUTH_CODE_TTL_SECONDS },
+      );
+
+      const redirect = new URL(redirectUri);
+      redirect.searchParams.set("code", authorizationCode);
+      if (state) redirect.searchParams.set("state", state);
+      return addCors(
+        new Response(null, {
+          status: 302,
+          headers: { Location: redirect.toString() },
+        }),
+        origin,
+      );
+    }
+
+    if (url.pathname === "/token") {
+      if (request.method !== "POST") {
+        return addCors(new Response("Method Not Allowed", { status: 405 }), origin);
+      }
+
+      let params: URLSearchParams;
+      try {
+        params = await parseTokenRequestParams(request);
+      } catch {
+        return addCors(
+          oauthErrorResponse("invalid_request", 400, "Unable to parse token request body"),
+          origin,
+        );
+      }
+
+      const grantType = params.get("grant_type");
+      const clientId = params.get("client_id");
+      if (!grantType) {
+        return addCors(
+          oauthErrorResponse("invalid_request", 400, "grant_type is required"),
+          origin,
+        );
+      }
+      if (!clientId) {
+        return addCors(
+          oauthErrorResponse("invalid_client", 401, "client_id is required"),
+          origin,
+        );
+      }
+
+      const client = await kvGetJson<RegisteredClient>(
+        env.MCP_CLIENTS,
+        clientKey(clientId),
+      );
+      if (!client) {
+        return addCors(
+          oauthErrorResponse("invalid_client", 401, "Unknown client_id"),
+          origin,
+        );
+      }
+
+      if (client.tokenEndpointAuthMethod === "client_secret_post") {
+        const clientSecret = params.get("client_secret");
+        if (!clientSecret || clientSecret !== client.clientSecret) {
+          return addCors(
+            oauthErrorResponse("invalid_client", 401, "Invalid client_secret"),
+            origin,
+          );
+        }
+      }
+
+      if (grantType === "authorization_code") {
+        const code = params.get("code");
+        const redirectUri = params.get("redirect_uri");
+        const codeVerifier = params.get("code_verifier");
+        if (!code || !redirectUri || !codeVerifier) {
+          return addCors(
+            oauthErrorResponse(
+              "invalid_request",
+              400,
+              "code, redirect_uri, and code_verifier are required",
+            ),
+            origin,
+          );
+        }
+
+        const codeRecord = await kvGetJson<AuthorizationCodeRecord>(
+          env.MCP_CLIENTS,
+          authCodeKey(code),
+        );
+        if (!codeRecord) {
+          return addCors(
+            oauthErrorResponse("invalid_grant", 400, "Invalid or expired authorization code"),
+            origin,
+          );
+        }
+
+        if (codeRecord.clientId !== clientId || codeRecord.redirectUri !== redirectUri) {
+          return addCors(
+            oauthErrorResponse("invalid_grant", 400, "Authorization code does not match client"),
+            origin,
+          );
+        }
+
+        const expectedChallenge = await sha256Base64Url(codeVerifier);
+        if (expectedChallenge !== codeRecord.codeChallenge) {
+          return addCors(
+            oauthErrorResponse("invalid_grant", 400, "Invalid PKCE code_verifier"),
+            origin,
+          );
+        }
+
+        await env.MCP_CLIENTS.delete(authCodeKey(code));
+
+        const now = Math.floor(Date.now() / 1000);
+        const accessToken = randomOpaqueToken(32);
+        const refreshToken = randomOpaqueToken(32);
+        const accessRecord: AccessTokenRecord = {
+          clientId,
+          scope: codeRecord.scope,
+          issuedAt: now,
+        };
+        const refreshRecord: RefreshTokenRecord = {
+          clientId,
+          scope: codeRecord.scope,
+          issuedAt: now,
+        };
+
+        await env.MCP_CLIENTS.put(
+          accessTokenKey(accessToken),
+          JSON.stringify(accessRecord),
+          { expirationTtl: ACCESS_TOKEN_TTL_SECONDS },
+        );
+        await env.MCP_CLIENTS.put(
+          refreshTokenKey(refreshToken),
+          JSON.stringify(refreshRecord),
+          { expirationTtl: REFRESH_TOKEN_TTL_SECONDS },
+        );
+
+        return addCors(
+          jsonResponse(200, {
+            token_type: "Bearer",
+            access_token: accessToken,
+            expires_in: ACCESS_TOKEN_TTL_SECONDS,
+            refresh_token: refreshToken,
+            scope: codeRecord.scope,
+          }),
+          origin,
+        );
+      }
+
+      if (grantType === "refresh_token") {
+        const refreshToken = params.get("refresh_token");
+        if (!refreshToken) {
+          return addCors(
+            oauthErrorResponse("invalid_request", 400, "refresh_token is required"),
+            origin,
+          );
+        }
+
+        const refreshRecord = await kvGetJson<RefreshTokenRecord>(
+          env.MCP_CLIENTS,
+          refreshTokenKey(refreshToken),
+        );
+        if (!refreshRecord || refreshRecord.clientId !== clientId) {
+          return addCors(
+            oauthErrorResponse("invalid_grant", 400, "Invalid refresh_token"),
+            origin,
+          );
+        }
+
+        const requestedScope = params.get("scope");
+        const scope = normalizeScope(requestedScope ?? refreshRecord.scope);
+        if (!isScopeSubset(scope, refreshRecord.scope)) {
+          return addCors(
+            oauthErrorResponse(
+              "invalid_scope",
+              400,
+              "Requested scope exceeds original refresh token scope",
+            ),
+            origin,
+          );
+        }
+
+        const now = Math.floor(Date.now() / 1000);
+        const nextAccessToken = randomOpaqueToken(32);
+        const nextRefreshToken = randomOpaqueToken(32);
+        const nextAccessRecord: AccessTokenRecord = {
+          clientId,
+          scope,
+          issuedAt: now,
+        };
+        const nextRefreshRecord: RefreshTokenRecord = {
+          clientId,
+          scope,
+          issuedAt: now,
+        };
+
+        await env.MCP_CLIENTS.put(
+          accessTokenKey(nextAccessToken),
+          JSON.stringify(nextAccessRecord),
+          { expirationTtl: ACCESS_TOKEN_TTL_SECONDS },
+        );
+        await env.MCP_CLIENTS.put(
+          refreshTokenKey(nextRefreshToken),
+          JSON.stringify(nextRefreshRecord),
+          { expirationTtl: REFRESH_TOKEN_TTL_SECONDS },
+        );
+        await env.MCP_CLIENTS.delete(refreshTokenKey(refreshToken));
+
+        return addCors(
+          jsonResponse(200, {
+            token_type: "Bearer",
+            access_token: nextAccessToken,
+            expires_in: ACCESS_TOKEN_TTL_SECONDS,
+            refresh_token: nextRefreshToken,
+            scope,
+          }),
+          origin,
+        );
+      }
+
+      return addCors(
+        oauthErrorResponse(
+          "unsupported_grant_type",
+          400,
+          `Unsupported grant_type: ${grantType}`,
+        ),
+        origin,
+      );
+    }
+
     // Only /mcp endpoint
     if (url.pathname !== "/mcp") {
       return addCors(new Response("Not Found", { status: 404 }), origin);
     }
 
-    // Auth check — Bearer MCP_AUTH_TOKEN
+    // Auth check — OAuth bearer access_token (stored in KV)
     const authHeader = request.headers.get("Authorization") ?? "";
     const token = authHeader.startsWith("Bearer ")
       ? authHeader.slice(7)
       : "";
-    if (!token || token !== env.MCP_AUTH_TOKEN) {
+    if (!token) {
       return addCors(
-        new Response(
-          JSON.stringify({ error: "Unauthorized — invalid or missing Bearer token" }),
-          {
-            status: 401,
-            headers: { "Content-Type": "application/json" },
-          },
+        jsonResponse(
+          401,
+          { error: "invalid_token", error_description: "Missing bearer token" },
+          { "WWW-Authenticate": 'Bearer error="invalid_token"' },
         ),
+        origin,
+      );
+    }
+
+    const tokenRecord = await validateBearerToken(env, token);
+    if (!tokenRecord) {
+      return addCors(
+        jsonResponse(
+          401,
+          { error: "invalid_token", error_description: "Unknown or expired access token" },
+          { "WWW-Authenticate": 'Bearer error="invalid_token"' },
+        ),
+        origin,
+      );
+    }
+
+    if (!scopeSet(tokenRecord.scope).has(OAUTH_SCOPE_DEFAULT)) {
+      return addCors(
+        jsonResponse(403, {
+          error: "insufficient_scope",
+          error_description: `Token must include "${OAUTH_SCOPE_DEFAULT}" scope`,
+        }),
         origin,
       );
     }
