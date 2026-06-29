@@ -1,0 +1,31 @@
+# Managed by fleet automation (MOT-29).
+# Run hooks against staged changes before each commit:
+#   pre-commit install
+repos:
+  - repo: https://github.com/pre-commit/mirrors-prettier
+    rev: v3.1.0
+    hooks:
+      - id: prettier
+        types_or: [javascript, jsx, ts, tsx, json, css, markdown]
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v4.6.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-yaml
+      - id: check-json
+      - id: check-added-large-files
+  - repo: local
+    hooks:
+      - id: eslint
+        name: eslint
+        entry: npx eslint
+        language: system
+        types_or: [javascript, jsx, ts, tsx]
+        pass_filenames: true
+      - id: test
+        name: test
+        entry: npm test
+        language: system
+        pass_filenames: false
+        always_run: true

@@ -50,7 +50,10 @@ function bufferToHex(buffer: ArrayBuffer): string {
     .join("");
 }
 
-async function createShimSignature(rawBody: string, secret: string): Promise<string> {
+async function createShimSignature(
+  rawBody: string,
+  secret: string,
+): Promise<string> {
   const ts = Math.floor(Date.now() / 1000);
   const key = await crypto.subtle.importKey(
     "raw",
@@ -288,10 +291,7 @@ function oauthRedirectError(
   });
 }
 
-async function kvGetJson<T>(
-  kv: KVNamespace,
-  key: string,
-): Promise<T | null> {
+async function kvGetJson<T>(kv: KVNamespace, key: string): Promise<T | null> {
   const value = await kv.get(key);
   if (!value) return null;
   return JSON.parse(value) as T;
@@ -302,7 +302,10 @@ function uint8ToBase64Url(bytes: Uint8Array): string {
   for (const b of bytes) {
     binary += String.fromCharCode(b);
   }
-  return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
+  return btoa(binary)
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_")
+    .replace(/=+$/g, "");
 }
 
 function randomOpaqueToken(byteLength = 32): string {
@@ -312,7 +315,10 @@ function randomOpaqueToken(byteLength = 32): string {
 }
 
 async function sha256Base64Url(input: string): Promise<string> {
-  const digest = await crypto.subtle.digest("SHA-256", textEncoder.encode(input));
+  const digest = await crypto.subtle.digest(
+    "SHA-256",
+    textEncoder.encode(input),
+  );
   return uint8ToBase64Url(new Uint8Array(digest));
 }
 
@@ -350,7 +356,9 @@ function oauthMetadata(origin: string): Record<string, unknown> {
   };
 }
 
-function oauthProtectedResourceMetadata(origin: string): Record<string, unknown> {
+function oauthProtectedResourceMetadata(
+  origin: string,
+): Record<string, unknown> {
   return {
     resource: `${origin}/mcp`,
     authorization_servers: [origin],
@@ -359,7 +367,9 @@ function oauthProtectedResourceMetadata(origin: string): Record<string, unknown>
   };
 }
 
-async function parseTokenRequestParams(request: Request): Promise<URLSearchParams> {
+async function parseTokenRequestParams(
+  request: Request,
+): Promise<URLSearchParams> {
   const contentType = request.headers.get("Content-Type") ?? "";
   if (contentType.includes("application/json")) {
     const body = (await request.json()) as Record<string, unknown>;
@@ -395,7 +405,10 @@ async function validateBearerToken(
   env: Env,
   bearerToken: string,
 ): Promise<AccessTokenRecord | null> {
-  return kvGetJson<AccessTokenRecord>(env.MCP_CLIENTS, accessTokenKey(bearerToken));
+  return kvGetJson<AccessTokenRecord>(
+    env.MCP_CLIENTS,
+    accessTokenKey(bearerToken),
+  );
 }
 
 function wantsJsonMcpResponse(request: Request): boolean {
@@ -403,8 +416,12 @@ function wantsJsonMcpResponse(request: Request): boolean {
   return !accept || accept.toLowerCase().includes("application/json");
 }
 
-async function convertSseToJsonRpcResponse(response: Response): Promise<Response> {
-  const contentType = (response.headers.get("Content-Type") ?? "").toLowerCase();
+async function convertSseToJsonRpcResponse(
+  response: Response,
+): Promise<Response> {
+  const contentType = (
+    response.headers.get("Content-Type") ?? ""
+  ).toLowerCase();
   if (!contentType.includes("text/event-stream")) return response;
 
   const sseBody = await response.text();
@@ -499,7 +516,10 @@ function createMcpServer(
         computers: Array<Record<string, unknown>>;
       };
       const lines = data.computers.map(
-        (c) => `- ${c.id}  name=${c.name ?? "?"}  status=${c.status}  provider=${c.providerType ?? "?"}`,
+        (c) =>
+          `- ${c.id}  name=${c.name ?? "?"}  status=${c.status}  provider=${
+            c.providerType ?? "?"
+          }`,
       );
       return {
         content: [
@@ -557,7 +577,8 @@ function createMcpServer(
           computers: Array<{ id: string; status: string }>;
         };
         const active = data.computers.filter((c) => c.status === "active");
-        if (active.length === 0) throw new Error("No active computers available");
+        if (active.length === 0)
+          throw new Error("No active computers available");
         computerId = active[0].id;
       }
 
@@ -573,8 +594,9 @@ function createMcpServer(
           args.autonomy;
       }
       if (args.reasoningEffort) {
-        (sessionBody.sessionSettings as Record<string, unknown>).reasoningEffort =
-          args.reasoningEffort;
+        (
+          sessionBody.sessionSettings as Record<string, unknown>
+        ).reasoningEffort = args.reasoningEffort;
       }
 
       const session = (await factoryFetch("/sessions", apiKey, {
@@ -639,7 +661,8 @@ function createMcpServer(
           computers: Array<{ id: string; status: string }>;
         };
         const active = data.computers.filter((c) => c.status === "active");
-        if (active.length === 0) throw new Error("No active computers available");
+        if (active.length === 0)
+          throw new Error("No active computers available");
         computerId = active[0].id;
       }
 
@@ -649,7 +672,11 @@ function createMcpServer(
       const sessionSettings: Record<string, unknown> = { model };
       if (args.autonomy) sessionSettings.autonomyLevel = args.autonomy;
 
-      const results: Array<{ index: number; sessionId: string; prompt: string }> = [];
+      const results: Array<{
+        index: number;
+        sessionId: string;
+        prompt: string;
+      }> = [];
       const errors: Array<{ index: number; error: string }> = [];
 
       // Process in batches of 10 to avoid overwhelming the API
@@ -696,7 +723,11 @@ function createMcpServer(
         ),
       ];
       if (errors.length > 0) {
-        lines.push(``, `Errors:`, ...errors.map((e) => `  ${e.index}: ${e.error}`));
+        lines.push(
+          ``,
+          `Errors:`,
+          ...errors.map((e) => `  ${e.index}: ${e.error}`),
+        );
       }
 
       return {
@@ -719,7 +750,9 @@ function createMcpServer(
         model: z
           .string()
           .optional()
-          .describe("Model to use (e.g. claude-opus-4-7, claude-sonnet-4-6, gpt-5)"),
+          .describe(
+            "Model to use (e.g. claude-opus-4-7, claude-sonnet-4-6, gpt-5)",
+          ),
         autonomy: z
           .enum(["off", "low", "medium", "high"])
           .optional()
@@ -747,7 +780,9 @@ function createMcpServer(
           .max(3600)
           .optional()
           .default(600)
-          .describe("Max seconds to wait before giving up (30–3600, default 600)"),
+          .describe(
+            "Max seconds to wait before giving up (30–3600, default 600)",
+          ),
       },
     },
     async (args) => {
@@ -758,7 +793,8 @@ function createMcpServer(
           computers: Array<{ id: string; status: string }>;
         };
         const active = data.computers.filter((c) => c.status === "active");
-        if (active.length === 0) throw new Error("No active computers available");
+        if (active.length === 0)
+          throw new Error("No active computers available");
         computerId = active[0].id;
       }
 
@@ -776,8 +812,9 @@ function createMcpServer(
           args.autonomy;
       }
       if (args.reasoningEffort) {
-        (sessionBody.sessionSettings as Record<string, unknown>).reasoningEffort =
-          args.reasoningEffort;
+        (
+          sessionBody.sessionSettings as Record<string, unknown>
+        ).reasoningEffort = args.reasoningEffort;
       }
 
       const session = (await factoryFetch("/sessions", apiKey, {
@@ -912,13 +949,15 @@ function createMcpServer(
           ((s.title?.length ?? 0) > 80 ? "..." : "");
         const created = new Date(s.createdAt).toISOString();
         const computerName = s.computerId
-          ? (computerNames.get(s.computerId) ?? "unknown")
+          ? computerNames.get(s.computerId) ?? "unknown"
           : "?";
         const computerLabel = s.computerId
           ? `${computerName} (${s.computerId})`
           : "?";
         return [
-          `[${idx + 1}] id=${s.sessionId}  status=${s.status}  computer=${computerLabel}`,
+          `[${idx + 1}] id=${s.sessionId}  status=${
+            s.status
+          }  computer=${computerLabel}`,
           `    msgs=${s.messageCount}  created=${created}`,
           `    title: ${title}`,
         ].join("\n");
@@ -928,7 +967,9 @@ function createMcpServer(
         content: [
           {
             type: "text",
-            text: `${sessions.length} droid session(s):\n\n${blocks.join("\n\n")}`,
+            text: `${sessions.length} droid session(s):\n\n${blocks.join(
+              "\n\n",
+            )}`,
           },
         ],
       };
@@ -979,7 +1020,9 @@ function createMcpServer(
               ? `${elapsed}s`
               : elapsed < 3600
                 ? `${Math.floor(elapsed / 60)}m ${elapsed % 60}s`
-                : `${Math.floor(elapsed / 3600)}h ${Math.floor((elapsed % 3600) / 60)}m`;
+                : `${Math.floor(elapsed / 3600)}h ${Math.floor(
+                    (elapsed % 3600) / 60,
+                  )}m`;
 
           // Get last message preview
           let lastMsg = "(no messages)";
@@ -990,7 +1033,10 @@ function createMcpServer(
             )) as { messages: Array<{ role: string; content: unknown }> };
             if (msgs.messages && msgs.messages.length > 0) {
               const m = msgs.messages[msgs.messages.length - 1];
-              lastMsg = `[${m.role}] ${JSON.stringify(m.content).slice(0, 120)}`;
+              lastMsg = `[${m.role}] ${JSON.stringify(m.content).slice(
+                0,
+                120,
+              )}`;
             }
           } catch {
             lastMsg = "(error fetching)";
@@ -1049,7 +1095,9 @@ function createMcpServer(
           Record<string, unknown>
         >,
         factoryFetch(
-          `/sessions/${args.sessionId}/messages?limit=${args.messageLimit ?? 200}`,
+          `/sessions/${args.sessionId}/messages?limit=${
+            args.messageLimit ?? 200
+          }`,
           apiKey,
         ) as Promise<{ messages: Msg[] }>,
       ]);
@@ -1065,7 +1113,9 @@ function createMcpServer(
       >();
 
       for (const msg of msgs) {
-        const blocks = Array.isArray(msg.content) ? (msg.content as MsgBlock[]) : [];
+        const blocks = Array.isArray(msg.content)
+          ? (msg.content as MsgBlock[])
+          : [];
         const msgTs = msg.createdAt
           ? new Date(msg.createdAt).toISOString()
           : "?";
@@ -1112,13 +1162,20 @@ function createMcpServer(
         for (const block of blocks) {
           if (block.type === "thinking") {
             const snippet = ((block.thinking as string) ?? "").slice(0, 300);
-            parts.push(`<thinking>${snippet}${snippet.length >= 300 ? "..." : ""}</thinking>`);
+            parts.push(
+              `<thinking>${snippet}${
+                snippet.length >= 300 ? "..." : ""
+              }</thinking>`,
+            );
           } else if (block.type === "text") {
             const text = ((block.text as string) ?? "").slice(0, 600);
             parts.push(text);
           } else if (block.type === "tool_use") {
             parts.push(
-              `[tool_use: ${block.name}(${JSON.stringify(block.input).slice(0, 200)})]`,
+              `[tool_use: ${block.name}(${JSON.stringify(block.input).slice(
+                0,
+                200,
+              )})]`,
             );
           } else if (block.type === "tool_result") {
             const resultContent = JSON.stringify(
@@ -1138,17 +1195,26 @@ function createMcpServer(
       const lines: string[] = [
         `Droid ${args.sessionId}:`,
         `  status:        ${session.status ?? "?"}`,
-        `  title:         ${((session.title as string) ?? "untitled").slice(0, 120)}`,
+        `  title:         ${((session.title as string) ?? "untitled").slice(
+          0,
+          120,
+        )}`,
         `  computer:      ${session.computerId ?? "?"}`,
         `  model:         ${ss?.model ?? "?"}`,
         `  messageCount:  ${session.messageCount ?? msgs.length}`,
-        `  createdAt:     ${new Date((session.createdAt as number) ?? 0).toISOString()}`,
-        `  updatedAt:     ${new Date((session.updatedAt as number) ?? 0).toISOString()}`,
+        `  createdAt:     ${new Date(
+          (session.createdAt as number) ?? 0,
+        ).toISOString()}`,
+        `  updatedAt:     ${new Date(
+          (session.updatedAt as number) ?? 0,
+        ).toISOString()}`,
         ``,
       ];
 
       if (pendingTools.size > 0) {
-        lines.push(`Active/pending tools (${pendingTools.size}) — currently in progress:`);
+        lines.push(
+          `Active/pending tools (${pendingTools.size}) — currently in progress:`,
+        );
         for (const [, t] of pendingTools) {
           lines.push(
             `  [IN-PROGRESS] ${t.name}  started=${t.startedAt}  args=${t.inputSummary}`,
@@ -1183,7 +1249,9 @@ function createMcpServer(
         "Get ALL messages from a droid session (not just recent ones), with role labels " +
         "(user/assistant) and timestamps. Useful for reviewing droid outputs and file contents.",
       inputSchema: {
-        sessionId: z.string().describe("The droid session ID to fetch messages for"),
+        sessionId: z
+          .string()
+          .describe("The droid session ID to fetch messages for"),
         maxMessages: z
           .number()
           .int()
@@ -1213,7 +1281,10 @@ function createMcpServer(
 
       const msgs = messages.messages ?? [];
       const msgLines = msgs.map(
-        (m: { role: string; content: unknown; createdAt?: number }, i: number) => {
+        (
+          m: { role: string; content: unknown; createdAt?: number },
+          i: number,
+        ) => {
           const ts = m.createdAt
             ? new Date(m.createdAt).toISOString()
             : "unknown";
@@ -1311,7 +1382,9 @@ function createMcpServer(
 
       const msgs = oldMessages.messages ?? [];
       if (msgs.length === 0) {
-        throw new Error(`Session ${args.sessionId} has no messages to resume from`);
+        throw new Error(
+          `Session ${args.sessionId} has no messages to resume from`,
+        );
       }
 
       // Step 2: Build context from old messages
@@ -1339,7 +1412,8 @@ function createMcpServer(
           computers: Array<{ id: string; status: string }>;
         };
         const active = data.computers.filter((c) => c.status === "active");
-        if (active.length === 0) throw new Error("No active computers available");
+        if (active.length === 0)
+          throw new Error("No active computers available");
         computerId = active[0].id;
       }
 
@@ -1419,11 +1493,15 @@ function createMcpServer(
         auto: z
           .enum(["high", "medium", "off"])
           .optional()
-          .describe("Auto mode mapping: high=auto-high, medium=auto-medium, off=normal"),
+          .describe(
+            "Auto mode mapping: high=auto-high, medium=auto-medium, off=normal",
+          ),
         mission: z
           .string()
           .optional()
-          .describe("Optional mission/session identifier forwarded as session_id"),
+          .describe(
+            "Optional mission/session identifier forwarded as session_id",
+          ),
       },
     },
     async (args) => {
@@ -1449,10 +1527,13 @@ function createMcpServer(
       }
 
       const result = await shimExec(shimUrl, shimSecret, payload);
-      const output = result.output.trim().length > 0
-        ? result.output
-        : "(shim returned no streamed output)";
-      const doneSuffix = result.done ? `\n\n[done] ${JSON.stringify(result.done)}` : "";
+      const output =
+        result.output.trim().length > 0
+          ? result.output
+          : "(shim returned no streamed output)";
+      const doneSuffix = result.done
+        ? `\n\n[done] ${JSON.stringify(result.done)}`
+        : "";
 
       return {
         content: [
@@ -1493,13 +1574,15 @@ function createMcpServer(
 // ---------------------------------------------------------------------------
 // CORS helpers
 // ---------------------------------------------------------------------------
-const PERPLEXITY_ORIGINS = ["https://www.perplexity.ai", "https://perplexity.ai"];
+const PERPLEXITY_ORIGINS = [
+  "https://www.perplexity.ai",
+  "https://perplexity.ai",
+];
 
 function isPerplexityOrigin(origin: string | null): boolean {
   if (!origin) return false;
   return PERPLEXITY_ORIGINS.some(
-    (allowed) =>
-      origin === allowed || origin.endsWith(".perplexity.ai"),
+    (allowed) => origin === allowed || origin.endsWith(".perplexity.ai"),
   );
 }
 
@@ -1515,10 +1598,7 @@ function corsHeaders(origin: string | null): Record<string, string> {
   return headers;
 }
 
-function addCors(
-  response: Response,
-  origin: string | null,
-): Response {
+function addCors(response: Response, origin: string | null): Response {
   const headers = new Headers(response.headers);
   const ch = corsHeaders(origin);
   for (const [k, v] of Object.entries(ch)) {
@@ -1578,7 +1658,10 @@ export default {
 
     if (url.pathname === "/register") {
       if (request.method !== "POST") {
-        return addCors(new Response("Method Not Allowed", { status: 405 }), origin);
+        return addCors(
+          new Response("Method Not Allowed", { status: 405 }),
+          origin,
+        );
       }
 
       let bodyUnknown: unknown;
@@ -1601,7 +1684,11 @@ export default {
         Array.isArray(bodyUnknown)
       ) {
         return addCors(
-          oauthErrorResponse("invalid_client_metadata", 400, "Invalid JSON body"),
+          oauthErrorResponse(
+            "invalid_client_metadata",
+            400,
+            "Invalid JSON body",
+          ),
           origin,
         );
       }
@@ -1621,9 +1708,11 @@ export default {
         );
       }
 
-      const tokenEndpointAuthMethod = (typeof body.token_endpoint_auth_method === "string"
-        ? body.token_endpoint_auth_method
-        : "client_secret_post") as TokenEndpointAuthMethod;
+      const tokenEndpointAuthMethod = (
+        typeof body.token_endpoint_auth_method === "string"
+          ? body.token_endpoint_auth_method
+          : "client_secret_post"
+      ) as TokenEndpointAuthMethod;
       if (
         tokenEndpointAuthMethod !== "client_secret_post" &&
         tokenEndpointAuthMethod !== "client_secret_basic"
@@ -1687,7 +1776,8 @@ export default {
       const client: RegisteredClient = {
         clientId,
         clientSecret,
-        clientName: typeof body.client_name === "string" ? body.client_name : undefined,
+        clientName:
+          typeof body.client_name === "string" ? body.client_name : undefined,
         redirectUris,
         tokenEndpointAuthMethod,
         grantTypes,
@@ -1717,7 +1807,10 @@ export default {
 
     if (url.pathname === "/authorize") {
       if (request.method !== "GET") {
-        return addCors(new Response("Method Not Allowed", { status: 405 }), origin);
+        return addCors(
+          new Response("Method Not Allowed", { status: 405 }),
+          origin,
+        );
       }
 
       const responseType = url.searchParams.get("response_type");
@@ -1791,7 +1884,9 @@ export default {
         );
       }
 
-      const requestedScope = normalizeScope(url.searchParams.get("scope") ?? client.scope);
+      const requestedScope = normalizeScope(
+        url.searchParams.get("scope") ?? client.scope,
+      );
       if (!isScopeSubset(requestedScope, client.scope)) {
         return addCors(
           oauthRedirectError(
@@ -1833,7 +1928,10 @@ export default {
 
     if (url.pathname === "/token") {
       if (request.method !== "POST") {
-        return addCors(new Response("Method Not Allowed", { status: 405 }), origin);
+        return addCors(
+          new Response("Method Not Allowed", { status: 405 }),
+          origin,
+        );
       }
 
       let params: URLSearchParams;
@@ -1841,7 +1939,11 @@ export default {
         params = await parseTokenRequestParams(request);
       } catch {
         return addCors(
-          oauthErrorResponse("invalid_request", 400, "Unable to parse token request body"),
+          oauthErrorResponse(
+            "invalid_request",
+            400,
+            "Unable to parse token request body",
+          ),
           origin,
         );
       }
@@ -1864,7 +1966,8 @@ export default {
       }
 
       const clientId = basicCredentials?.clientId ?? bodyClientId;
-      const presentedClientSecret = basicCredentials?.clientSecret ?? bodyClientSecret;
+      const presentedClientSecret =
+        basicCredentials?.clientSecret ?? bodyClientSecret;
       if (!grantType) {
         return addCors(
           oauthErrorResponse("invalid_request", 400, "grant_type is required"),
@@ -1877,9 +1980,17 @@ export default {
           origin,
         );
       }
-      if (basicCredentials && bodyClientId && bodyClientId !== basicCredentials.clientId) {
+      if (
+        basicCredentials &&
+        bodyClientId &&
+        bodyClientId !== basicCredentials.clientId
+      ) {
         return addCors(
-          oauthErrorResponse("invalid_client", 401, "client_id mismatch between body and basic auth"),
+          oauthErrorResponse(
+            "invalid_client",
+            401,
+            "client_id mismatch between body and basic auth",
+          ),
           origin,
         );
       }
@@ -1897,12 +2008,19 @@ export default {
 
       if (!presentedClientSecret) {
         return addCors(
-          oauthErrorResponse("invalid_client", 401, "client_secret is required"),
+          oauthErrorResponse(
+            "invalid_client",
+            401,
+            "client_secret is required",
+          ),
           origin,
         );
       }
 
-      if (!client.clientSecret || presentedClientSecret !== client.clientSecret) {
+      if (
+        !client.clientSecret ||
+        presentedClientSecret !== client.clientSecret
+      ) {
         return addCors(
           oauthErrorResponse("invalid_client", 401, "Invalid client_secret"),
           origin,
@@ -1930,14 +2048,25 @@ export default {
         );
         if (!codeRecord) {
           return addCors(
-            oauthErrorResponse("invalid_grant", 400, "Invalid or expired authorization code"),
+            oauthErrorResponse(
+              "invalid_grant",
+              400,
+              "Invalid or expired authorization code",
+            ),
             origin,
           );
         }
 
-        if (codeRecord.clientId !== clientId || codeRecord.redirectUri !== redirectUri) {
+        if (
+          codeRecord.clientId !== clientId ||
+          codeRecord.redirectUri !== redirectUri
+        ) {
           return addCors(
-            oauthErrorResponse("invalid_grant", 400, "Authorization code does not match client"),
+            oauthErrorResponse(
+              "invalid_grant",
+              400,
+              "Authorization code does not match client",
+            ),
             origin,
           );
         }
@@ -1945,7 +2074,11 @@ export default {
         const expectedChallenge = await sha256Base64Url(codeVerifier);
         if (expectedChallenge !== codeRecord.codeChallenge) {
           return addCors(
-            oauthErrorResponse("invalid_grant", 400, "Invalid PKCE code_verifier"),
+            oauthErrorResponse(
+              "invalid_grant",
+              400,
+              "Invalid PKCE code_verifier",
+            ),
             origin,
           );
         }
@@ -1993,7 +2126,11 @@ export default {
         const refreshToken = params.get("refresh_token");
         if (!refreshToken) {
           return addCors(
-            oauthErrorResponse("invalid_request", 400, "refresh_token is required"),
+            oauthErrorResponse(
+              "invalid_request",
+              400,
+              "refresh_token is required",
+            ),
             origin,
           );
         }
@@ -2077,9 +2214,7 @@ export default {
 
     // Auth check — OAuth bearer access_token (stored in KV)
     const authHeader = request.headers.get("Authorization") ?? "";
-    const token = authHeader.startsWith("Bearer ")
-      ? authHeader.slice(7)
-      : "";
+    const token = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : "";
     if (!token) {
       return addCors(
         jsonResponse(
@@ -2096,7 +2231,10 @@ export default {
       return addCors(
         jsonResponse(
           401,
-          { error: "invalid_token", error_description: "Unknown or expired access token" },
+          {
+            error: "invalid_token",
+            error_description: "Unknown or expired access token",
+          },
           { "WWW-Authenticate": 'Bearer error="invalid_token"' },
         ),
         origin,
@@ -2127,7 +2265,9 @@ export default {
       // We still route through Streamable HTTP transport, then convert SSE payload to JSON when needed.
       const forwardedHeaders = new Headers(request.headers);
       forwardedHeaders.set("Accept", "application/json, text/event-stream");
-      const forwardedRequest = new Request(request, { headers: forwardedHeaders });
+      const forwardedRequest = new Request(request, {
+        headers: forwardedHeaders,
+      });
 
       await server.connect(transport);
       const mcpResponse = await transport.handleRequest(forwardedRequest);
